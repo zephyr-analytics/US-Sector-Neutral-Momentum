@@ -94,8 +94,8 @@ class StockOnlyMomentum(QCAlgorithm):
         """
         Initializes the algorithm state, parameters, and scheduling.
         """
-        self.SetStartDate(2004, 1, 1)
-        self.SetCash(100_000)
+        # self.SetStartDate(2004, 1, 1)
+        # self.SetCash(100_000)
 
         # --------------------
         # Momentum parameters
@@ -142,8 +142,8 @@ class StockOnlyMomentum(QCAlgorithm):
         self.SetWarmUp(300)
 
         self.Schedule.On(
-            self.DateRules.MonthEnd("SPY"),
-            self.TimeRules.BeforeMarketClose("SPY", 5),
+            self.DateRules.month_end("SPY"),
+            self.TimeRules.before_market_close("SPY", 120),
             self.Rebalance
         )
 
@@ -393,7 +393,6 @@ class StockOnlyMomentum(QCAlgorithm):
             hist_idx = list(self.band_hist[s])
             historical_high = max(hist_idx) if hist_idx else idx
 
-            # NOTE histortical_high (=) is the biggest cancel of portfolio postions and creates concentration.
             if historical_high <= 0:
                 scale = 1.0
             elif idx >= historical_high:
