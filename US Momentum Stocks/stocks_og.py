@@ -22,34 +22,11 @@ class SectorTopUniverse(FundamentalUniverseSelectionModel):
     Morningstar sector.
     """
     def __init__(self, algo, blacklist=None):
-        """
-        Initializes the SectorTopUniverse.
-
-        Parameters
-        ----------
-        algo : QCAlgorithm
-            The algorithm instance.
-        blacklist : list of str, optional
-            List of ticker strings to exclude from selection.
-        """
         self.algo = algo
         self.blacklist = set(blacklist or [])
         super().__init__(self._select)
 
     def _select(self, fundamentals):
-        """
-        Performs the fundamental selection logic.
-
-        Parameters
-        ----------
-        fundamentals : list[Fundamental]
-            The list of fundamental data objects.
-
-        Returns
-        -------
-        list[Symbol]
-            The symbols to include in the universe.
-        """
         buckets = defaultdict(list)
 
         for f in fundamentals:
@@ -91,18 +68,13 @@ class StockOnlyMomentum(QCAlgorithm):
     """
 
     def Initialize(self):
-        """
-        Initializes the algorithm state, parameters, and scheduling.
-        """
-        # self.SetStartDate(2004, 1, 1)
-        # self.SetCash(100_000)
-
         # --------------------
         # Momentum parameters
         # --------------------
         self.lookbacks = [21, 63, 126, 189, 252]
         self.stock_count = 10
         self.max_weight = 0.20
+        self.set_start_date(2004,1,1)
 
         # --------------------
         # Band parameters
@@ -115,29 +87,27 @@ class StockOnlyMomentum(QCAlgorithm):
 
         # -------- BREADTH STATE --------
         self.allow_universe = True
-        self.current_band_idx = {}
-        self.bottom_frac_hist = deque(maxlen=3)
         self.BOTTOM_LEVELS = {0, 1, 2, 3, 4}
 
         # track worst breadth
-        self.min_bottom_frac = 1.0
-        self.was_risk_off = False  
+        self.max_stress_level = 0.0
+        self.was_risk_off = False
+
         self.SetUniverseSelection(
             SectorTopUniverse(self, blacklist={"GME", "AMC"})
         )
 
         self.symbols = set()
-
         self.adx_limit = 35
         self.adx_period = 14
 
         # Per-symbol state
-        self.ma = {}
+        self.ma = {}           # EMA — still needed daily for price-above-EMA filter
         self.adx = {}
-        self.stretch_max = {}
-        self.close_win = {}
-        self.stretch_ema = {}
-        self.band_hist = {}
+        self.stretch_ema = {}  # EMA of stretch — still updated daily for exhaustion check
+        self.stretch_max = {}  # Peak stretch — still tracked daily
+        self.close_win = {}    # Rolling close window — needed daily for std dev calc
+        self.band_hist = {}    # Band index history — now written only in Rebalance
 
         self.SetWarmUp(300)
 
@@ -148,40 +118,31 @@ class StockOnlyMomentum(QCAlgorithm):
         )
 
     def OnSecuritiesChanged(self, changes):
-        """
-        Initializes/cleans up indicators when securities enter or leave the universe.
-
-        Parameters
-        ----------
-        changes : SecurityChanges
-            The added and removed securities.
-        """
+        # TODO: Build in take profit mid month and test based on stretch and ADX.
         for sec in changes.AddedSecurities:
             sec.SetFeeModel(ConstantFeeModel(0))
             s = sec.Symbol
             self.symbols.add(s)
 
-            self.stretch_max[sec.Symbol] = 0.0
             self.ma[s] = self.EMA(s, self.band_len, Resolution.Daily)
             self.adx[s] = self.ADX(s, self.adx_period, Resolution.Daily)
             self.stretch_ema[s] = self.EMA(s, self.band_len, Resolution.Daily)
             self.close_win[s] = RollingWindow[float](self.band_len)
             self.band_hist[s] = RollingWindow[int](self.hist_len)
+            self.stretch_max[s] = 0.0
 
         for sec in changes.RemovedSecurities:
             s = sec.Symbol
             self.symbols.discard(s)
-            self.ma.pop(s, None)
-            self.stretch_max.pop(sec.Symbol, None)            
-            self.stretch_ema.pop(s, None)
-            self.close_win.pop(s, None)
-            self.band_hist.pop(s, None)
-            self.current_band_idx.pop(s, None)
+            for store in (self.ma, self.adx, self.stretch_ema,
+                          self.close_win, self.band_hist, self.stretch_max):
+                store.pop(s, None)
 
     def OnData(self, data):
         """
-        Updates technical indicators and band indices on every new data slice.
-        Also tracks peak stretch (Z-score) to anticipate momentum blow-offs.
+        Updates the rolling close window, stretch EMA, and peak stretch on
+        every bar. Band index computation has been moved to Rebalance since
+        it only affects monthly decisions.
         """
         for s in list(self.symbols):
             if not data.ContainsKey(s):
@@ -197,92 +158,131 @@ class StockOnlyMomentum(QCAlgorithm):
             if not self.close_win[s].IsReady or not self.ma[s].IsReady:
                 continue
 
-            # Calculate Standard Deviation and Mean
             dev = np.std(list(self.close_win[s]))
             if dev <= 0:
                 continue
 
             mid = self.ma[s].Current.Value
-            
-            # 1. Calculate the current Stretch (Z-score)
             stretch = abs(close - mid) / dev
             self.stretch_ema[s].Update(self.Time, stretch)
 
-            # 2. Track the long-term peak Stretch for this symbol
-            # This identifies the "Maximum Velocity" of the current multi-year trend
-            if s not in self.stretch_max:
-                self.stretch_max[s] = 0.0
-            
-            # Update the peak stretch seen so far
+            # Track lifetime peak stretch for exhaustion detection
             if stretch > self.stretch_max[s]:
                 self.stretch_max[s] = stretch
-
-            # 3. Calculate the Price Bands
-            bands = [
-                mid - dev * 1.618,
-                mid - dev * 1.382,
-                mid - dev,
-                mid - dev * 0.809,
-                mid - dev * 0.5,
-                mid - dev * 0.382,
-                mid,
-                mid + dev * 0.382,
-                mid + dev * 0.5,
-                mid + dev * 0.809,
-                mid + dev,
-                mid + dev * 1.382,
-                mid + dev * 1.618
-            ]
-
-            # 4. Map price to Band Index
-            idx = self._band_index(close, bands)
-            self.current_band_idx[s] = idx
 
     def _band_index(self, price, bands):
         """
         Determines which index a price occupies within a set of bands.
-
-        Parameters
-        ----------
-        price : float
-            Current price of the asset.
-        bands : list[float]
-            List of price levels defining the bands.
-
-        Returns
-        -------
-        int
-            The index of the band.
         """
         for i in range(len(bands) - 1):
             if bands[i] <= price < bands[i + 1]:
                 return i
         return len(bands) - 2
 
+    def _compute_bands(self, mid, dev, lm):
+        """
+        Builds the 13-level EMA-scaled band list for a symbol.
+
+        Parameters
+        ----------
+        mid : float
+            Current EMA value.
+        dev : float
+            Standard deviation of the close window.
+        lm : float
+            Current stretch EMA (used as the band multiplier anchor).
+
+        Returns
+        -------
+        list[float]
+        """
+        lm2 = lm / 2.0
+        lm3 = lm2 * 0.38196601
+        lm4 = lm * 1.38196601
+        lm5 = lm * 1.61803399
+        lm6 = (lm + lm2) / 2.0
+
+        return [
+            mid - dev * lm5,
+            mid - dev * lm4,
+            mid - dev * lm,
+            mid - dev * lm6,
+            mid - dev * lm2,
+            mid - dev * lm3,
+            mid,
+            mid + dev * lm3,
+            mid + dev * lm2,
+            mid + dev * lm6,
+            mid + dev * lm,
+            mid + dev * lm4,
+            mid + dev * lm5,
+        ]
+
+    def _compute_breadth_bands(self, mid, dev):
+        """
+        Builds the fixed-multiplier band list used for universe-wide breadth.
+        Kept separate from the EMA-scaled sizing bands.
+
+        Returns
+        -------
+        list[float]
+        """
+        return [
+            mid - dev * 1.618,
+            mid - dev * 1.382,
+            mid - dev,
+            mid - dev * 0.809,
+            mid - dev * 0.5,
+            mid - dev * 0.382,
+            mid,
+            mid + dev * 0.382,
+            mid + dev * 0.5,
+            mid + dev * 0.809,
+            mid + dev,
+            mid + dev * 1.382,
+            mid + dev * 1.618,
+        ]
+
     def Rebalance(self):
         """
         Main execution logic for rebalancing the portfolio at month-end.
-        
-        Evaluates market breadth stress, ranks momentum, and applies 
-        historical high band scaling to position sizing.
+
+        All band calculations (breadth and sizing) happen here so that the
+        band state is always consistent with the moment a trade decision is made.
         """
         if self.IsWarmingUp:
             return
 
-        # -------- UNIVERSE-WIDE BREADTH --------
-        idxs = list(self.current_band_idx.values())
-        if len(idxs) < 50:
+        # -------- COMPUTE BANDS AND BREADTH AT REBALANCE TIME --------
+        band_indices = {}
+        for s in list(self.symbols):
+            if not self.close_win[s].IsReady or not self.ma[s].IsReady:
+                continue
+
+            closes = list(self.close_win[s])
+            dev = np.std(closes)
+            if dev <= 0:
+                continue
+
+            mid = self.ma[s].Current.Value
+            price = self.Securities[s].Price
+
+            bands = self._compute_breadth_bands(mid, dev)
+            band_indices[s] = self._band_index(price, bands)
+
+        if len(band_indices) < 50:
             return
 
-        bottom_frac = sum(i in self.BOTTOM_LEVELS for i in idxs) / len(idxs)
+        # -------- BREADTH REGIME --------
+        bottom_frac = sum(
+            i in self.BOTTOM_LEVELS for i in band_indices.values()
+        ) / len(band_indices)
 
-        if not hasattr(self, 'max_stress_level'): self.max_stress_level = 0.0
         self.max_stress_level = max(self.max_stress_level, bottom_frac)
 
-        # -------- BREADTH REGIME --------
         if bottom_frac >= 0.45:
             self.allow_universe = False
-            self.was_risk_off = True 
+            self.was_risk_off = True
 
         elif self.was_risk_off:
             denominator = max(self.max_stress_level, 0.10)
@@ -296,16 +296,16 @@ class StockOnlyMomentum(QCAlgorithm):
 
                 self.allow_universe = True
                 self.was_risk_off = False
-                self.max_stress_level = 0.0 
+                self.max_stress_level = 0.0
         else:
             self.allow_universe = True
 
         if not self.allow_universe:
             self.Liquidate()
-            self.Debug("Risk-Off.") # Corrected from lowercase debug
+            self.Debug("Risk-Off.")
             return
 
-        # -------- NORMAL REBALANCE LOGIC --------
+        # -------- MOMENTUM RANKING --------
         hist = self.History(
             list(self.symbols),
             max(self.lookbacks) + 1,
@@ -315,14 +315,14 @@ class StockOnlyMomentum(QCAlgorithm):
         if hist.empty:
             return
 
-        closes = hist["close"].unstack(0)
+        closes_df = hist["close"].unstack(0)
         momentum = {}
 
         for s in self.symbols:
-            if s not in closes:
+            if s not in closes_df:
                 continue
 
-            px = closes[s]
+            px = closes_df[s]
             if len(px) < max(self.lookbacks) + 1:
                 continue
 
@@ -338,9 +338,7 @@ class StockOnlyMomentum(QCAlgorithm):
                 continue
 
             price = self.Securities[s].Price
-            ema = self.ma[s].Current.Value
-
-            if price <= ema:
+            if price <= self.ma[s].Current.Value:
                 continue
 
             if mom > 0:
@@ -352,9 +350,12 @@ class StockOnlyMomentum(QCAlgorithm):
 
         top = sorted(momentum, key=momentum.get, reverse=True)[:self.stock_count]
 
+        # -------- SIZING BANDS (computed fresh at rebalance) --------
         scaled = {}
         for s in top:
             if not self.ma[s].IsReady or not self.stretch_ema[s].IsReady:
+                continue
+            if not self.close_win[s].IsReady:
                 continue
 
             dev = np.std(list(self.close_win[s]))
@@ -363,32 +364,12 @@ class StockOnlyMomentum(QCAlgorithm):
 
             mid = self.ma[s].Current.Value
             lm = self.stretch_ema[s].Current.Value
-
-            lm2 = lm / 2.0
-            lm3 = lm2 * 0.38196601
-            lm4 = lm * 1.38196601
-            lm5 = lm * 1.61803399
-            lm6 = (lm + lm2) / 2.0
-
-            bands = [
-                mid - dev * lm5,
-                mid - dev * lm4,
-                mid - dev * lm,
-                mid - dev * lm6,
-                mid - dev * lm2,
-                mid - dev * lm3,
-                mid,
-                mid + dev * lm3,
-                mid + dev * lm2,
-                mid + dev * lm6,
-                mid + dev * lm,
-                mid + dev * lm4,
-                mid + dev * lm5
-            ]
-
             price = self.Securities[s].Price
+
+            bands = self._compute_bands(mid, dev, lm)
             idx = self._band_index(price, bands)
 
+            # Record this month's band index into history
             self.band_hist[s].Add(idx)
             hist_idx = list(self.band_hist[s])
             historical_high = max(hist_idx) if hist_idx else idx
@@ -400,55 +381,43 @@ class StockOnlyMomentum(QCAlgorithm):
             else:
                 scale = max(0.2, 1.0 - idx / historical_high)
 
-            scaled[s] = momentum[s] * scale
-
-            # 2. NEW: Anticipatory Exhaustion Scaling
-            # Pull the current stretch and the peak stretch we recorded in OnData
+            # Anticipatory exhaustion scaling
             current_stretch = self.stretch_ema[s].Current.Value
             peak_stretch = self.stretch_max.get(s, 0.0)
 
-            # If we are in high bands (idx >= 10) but the stretch has decayed 20% from peak
             if idx >= 10 and peak_stretch > 0:
                 if current_stretch < (peak_stretch * 0.80):
-                    # We override the scale to its minimum (0.2) because 
-                    # the momentum is 'exhausted' even if the price is still high.
                     scale = 0.2
                     self.Debug(f"ANTICIPATION: Scaling down {s.Value} due to Stretch Exhaustion.")
 
-            # 3. Apply the final scale to momentum
             scaled[s] = momentum[s] * scale
 
-        # -------- FINAL WEIGHTING LOGIC --------
+        # -------- FINAL WEIGHTING --------
         if not scaled:
             self.Liquidate()
             self.Debug("No Assets to trade.")
             return
 
-        # 1. Proportional Weights
         total_scaled = sum(scaled.values())
-        raw_weights = {s: (v / total_scaled) for s, v in scaled.items()}
-
-        # 2. Apply 20% Cap
+        raw_weights = {s: v / total_scaled for s, v in scaled.items()}
         capped_weights = {s: min(self.max_weight, w) for s, w in raw_weights.items()}
 
-        # 3. Re-scale to ensure we are actually using our capital
         current_sum = sum(capped_weights.values())
-        if current_sum > 0:
-            final_weights = {s: w / current_sum for s, w in capped_weights.items()}
-        else:
-            final_weights = {}
+        final_weights = (
+            {s: w / current_sum for s, w in capped_weights.items()}
+            if current_sum > 0 else {}
+        )
 
-        # 4. Execution
         self.Liquidate()
         for s, w in final_weights.items():
             if w > 0:
                 self.SetHoldings(s, w)
 
-        # Filter for weights > 0 before joining the string
-        output = ", ".join([f"{s.Value}: {w*100:.1f}%" for s, w in final_weights.items() if w > 0])
-
-        # Only print if there's actually something to show
+        output = ", ".join(
+            f"{s.Value}: {w*100:.1f}%"
+            for s, w in final_weights.items() if w > 0
+        )
         if output:
             self.Debug(f"Weights @ {self.Time.strftime('%Y-%m-%d')}: {output}")
         else:
-            self.Debug(f"Weights @ {self.Time.strftime('%Y-%m-%d')}: No active positions (All weights 0%)")
+            self.Debug(f"Weights @ {self.Time.strftime('%Y-%m-%d')}: No active positions")
