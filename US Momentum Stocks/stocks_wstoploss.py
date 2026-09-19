@@ -16,7 +16,7 @@ import numpy as np
 class SectorTopUniverse(FundamentalUniverseSelectionModel):
     """
     Selection model for a sector-neutral large-cap universe.
-    
+
     Filters for primary exchange listing, minimum price, and minimum market cap, 
     then selects the top 75 stocks by market capitalization within each 
     Morningstar sector.
@@ -71,10 +71,10 @@ class StockOnlyMomentum(QCAlgorithm):
         # --------------------
         # Momentum parameters
         # --------------------
+        self.set_start_date(2004, 1, 1)
         self.lookbacks = [21, 63, 126, 189, 252]
         self.stock_count = 10
         self.max_weight = 0.20
-        self.set_start_date(2004,1,1)
 
         # --------------------
         # Band parameters
@@ -89,7 +89,6 @@ class StockOnlyMomentum(QCAlgorithm):
         self.allow_universe = True
         self.BOTTOM_LEVELS = {0, 1, 2, 3, 4}
 
-        # track worst breadth
         self.max_stress_level = 0.0
         self.was_risk_off = False
 
@@ -97,17 +96,21 @@ class StockOnlyMomentum(QCAlgorithm):
             SectorTopUniverse(self, blacklist={"GME", "AMC"})
         )
 
+        # -------- STOP LOSS --------
+        self.period_stop_loss = 0.25
+        self.period_entry_value = {}
+
         self.symbols = set()
         self.adx_limit = 35
         self.adx_period = 14
 
         # Per-symbol state
-        self.ma = {}           # EMA — still needed daily for price-above-EMA filter
+        self.ma = {}
         self.adx = {}
-        self.stretch_ema = {}  # EMA of stretch — still updated daily for exhaustion check
-        self.stretch_max = {}  # Peak stretch — still tracked daily
-        self.close_win = {}    # Rolling close window — needed daily for std dev calc
-        self.band_hist = {}    # Band index history — now written only in Rebalance
+        self.stretch_ema = {}
+        self.stretch_max = {}
+        self.close_win = {}
+        self.band_hist = {}
 
         self.SetWarmUp(300)
 
@@ -118,7 +121,6 @@ class StockOnlyMomentum(QCAlgorithm):
         )
 
     def OnSecuritiesChanged(self, changes):
-        # TODO: Build in take profit mid month and test based on stretch and ADX.
         for sec in changes.AddedSecurities:
             sec.SetFeeModel(ConstantFeeModel(0))
             s = sec.Symbol
@@ -139,11 +141,6 @@ class StockOnlyMomentum(QCAlgorithm):
                 store.pop(s, None)
 
     def OnData(self, data):
-        """
-        Updates the rolling close window, stretch EMA, and peak stretch on
-        every bar. Band index computation has been moved to Rebalance since
-        it only affects monthly decisions.
-        """
         for s in list(self.symbols):
             if not data.ContainsKey(s):
                 continue
@@ -166,36 +163,30 @@ class StockOnlyMomentum(QCAlgorithm):
             stretch = abs(close - mid) / dev
             self.stretch_ema[s].Update(self.Time, stretch)
 
-            # Track lifetime peak stretch for exhaustion detection
             if stretch > self.stretch_max[s]:
                 self.stretch_max[s] = stretch
 
+            # Per-symbol cumulative period stop-loss
+            if (not self.IsWarmingUp
+                    and self.Portfolio[s].Invested
+                    and s in self.period_entry_value
+                    and self.period_entry_value[s] > 0):
+                entry = self.period_entry_value[s]
+                period_loss = (entry - close) / entry
+                if period_loss >= self.period_stop_loss:
+                    self.Liquidate(s)
+                    self.Debug(
+                        f"STOP-LOSS {s.Value} @ {self.Time.strftime('%Y-%m-%d')}: "
+                        f"period loss {period_loss:.1%}"
+                    )
+
     def _band_index(self, price, bands):
-        """
-        Determines which index a price occupies within a set of bands.
-        """
         for i in range(len(bands) - 1):
             if bands[i] <= price < bands[i + 1]:
                 return i
         return len(bands) - 2
 
     def _compute_bands(self, mid, dev, lm):
-        """
-        Builds the 13-level EMA-scaled band list for a symbol.
-
-        Parameters
-        ----------
-        mid : float
-            Current EMA value.
-        dev : float
-            Standard deviation of the close window.
-        lm : float
-            Current stretch EMA (used as the band multiplier anchor).
-
-        Returns
-        -------
-        list[float]
-        """
         lm2 = lm / 2.0
         lm3 = lm2 * 0.38196601
         lm4 = lm * 1.38196601
@@ -219,14 +210,6 @@ class StockOnlyMomentum(QCAlgorithm):
         ]
 
     def _compute_breadth_bands(self, mid, dev):
-        """
-        Builds the fixed-multiplier band list used for universe-wide breadth.
-        Kept separate from the EMA-scaled sizing bands.
-
-        Returns
-        -------
-        list[float]
-        """
         return [
             mid - dev * 1.618,
             mid - dev * 1.382,
@@ -252,6 +235,8 @@ class StockOnlyMomentum(QCAlgorithm):
         """
         if self.IsWarmingUp:
             return
+
+        self.period_entry_value = {}
 
         # -------- COMPUTE BANDS AND BREADTH AT REBALANCE TIME --------
         band_indices = {}
@@ -369,7 +354,6 @@ class StockOnlyMomentum(QCAlgorithm):
             bands = self._compute_bands(mid, dev, lm)
             idx = self._band_index(price, bands)
 
-            # Record this month's band index into history
             self.band_hist[s].Add(idx)
             hist_idx = list(self.band_hist[s])
             historical_high = max(hist_idx) if hist_idx else idx
@@ -398,6 +382,14 @@ class StockOnlyMomentum(QCAlgorithm):
             self.Debug("No Assets to trade.")
             return
 
+        # Drop zero-scaled entries before normalizing
+        # scaled = {s: v for s, v in scaled.items() if v > 1e-9}
+
+        if not scaled:
+            self.Liquidate()
+            self.Debug("No Assets passed scaling.")
+            return
+
         total_scaled = sum(scaled.values())
         raw_weights = {s: v / total_scaled for s, v in scaled.items()}
         capped_weights = {s: min(self.max_weight, w) for s, w in raw_weights.items()}
@@ -408,10 +400,16 @@ class StockOnlyMomentum(QCAlgorithm):
             if current_sum > 0 else {}
         )
 
-        self.Liquidate()
+        # Exit positions not in the new target set
+        for holding in self.Portfolio.Values:
+            if holding.Invested and holding.Symbol not in final_weights:
+                self.Liquidate(holding.Symbol)
+
+        # Enter/resize target positions — skip if a liquidation order is still open
         for s, w in final_weights.items():
-            if w > 0:
+            if w > 0 and not self.Transactions.GetOpenOrders(s):
                 self.SetHoldings(s, w)
+                self.period_entry_value[s] = self.Securities[s].Price
 
         output = ", ".join(
             f"{s.Value}: {w*100:.1f}%"
