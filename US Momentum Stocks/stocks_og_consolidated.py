@@ -16,7 +16,7 @@ import numpy as np
 class SectorTopUniverse(FundamentalUniverseSelectionModel):
     """
     Selection model for a sector-neutral large-cap universe.
-    
+
     Filters for primary exchange listing, minimum price, and minimum market cap, 
     then selects the top 75 stocks by market capitalization within each 
     Morningstar sector.
@@ -445,10 +445,46 @@ class StockOnlyMomentum(QCAlgorithm):
             final_weights = {}
 
         # 4. Execution
-        self.Liquidate()
-        for s, w in final_weights.items():
-            if w > 0:
+        # Two explicit phases: sell down everything that's closing or
+        # shrinking first, THEN open/grow the new positions. A single
+        # blanket self.Liquidate() followed by SetHoldings() (or even a
+        # single unordered SetHoldings pass) can submit a same-tick buy
+        # for one symbol before a same-tick sell for another has freed up
+        # cash -- in the worst case (a symbol held last month getting
+        # liquidated wholesale AND separately resized by SetHoldings) that
+        # stacked into an unintended short. Doing sells first, in their
+        # own pass, means the freed cash and closed positions are already
+        # reflected before any new buy order is even constructed.
+        current_value = self.Portfolio.TotalPortfolioValue
+        current_weights = {
+            sym: (holding.HoldingsValue / current_value if current_value else 0.0)
+            for sym, holding in self.Portfolio.items()
+            if holding.Invested
+        }
+
+        all_symbols = set(current_weights) | set(final_weights)
+        closing_or_reducing = []
+        opening_or_increasing = []
+
+        for s in all_symbols:
+            target_w = final_weights.get(s, 0.0)
+            current_w = current_weights.get(s, 0.0)
+            if target_w < current_w:
+                closing_or_reducing.append((s, target_w))
+            elif target_w > current_w:
+                opening_or_increasing.append((s, target_w))
+            # target_w == current_w: already at the right size, no order needed
+
+        # Phase 1: full exits and trims (frees cash / closes exposure)
+        for s, w in closing_or_reducing:
+            if w <= 0:
+                self.Liquidate(s)
+            else:
                 self.SetHoldings(s, w)
+
+        # Phase 2: new opens and size increases (uses the freed cash)
+        for s, w in opening_or_increasing:
+            self.SetHoldings(s, w)
 
         # Filter for weights > 0 before joining the string
         output = ", ".join([f"{s.Value}: {w*100:.1f}%" for s, w in final_weights.items() if w > 0])
